@@ -1,9 +1,9 @@
 /**
- * CFFBRW Browser Bridge — Popup script (v2)
+ * CFFBRW Browser Bridge — Popup (v2)
  *
- * Two compilation modes:
- *   1. Quick Compile — single page DOM snapshot (backward compat)
- *   2. Record & Compile — multi-page recording with state capture
+ * Two modes:
+ *   1. Quick Compile — single page snapshot → ToolSchema
+ *   2. Record & Compile — event-driven multi-page recording → ToolSchema
  */
 
 const gatewayInput = document.getElementById("gateway");
@@ -21,16 +21,8 @@ chrome.storage.local.get(["gatewayUrl", "workspaceToken"], (result) => {
 saveBtn.addEventListener("click", () => {
   const gatewayUrl = gatewayInput.value.trim().replace(/\/$/, "");
   const workspaceToken = tokenInput.value.trim();
-
-  if (!gatewayUrl) {
-    showStatus("Gateway URL is required", "err");
-    return;
-  }
-
-  try { new URL(gatewayUrl); } catch {
-    showStatus("Invalid URL format", "err");
-    return;
-  }
+  if (!gatewayUrl) { showStatus("Gateway URL required", "err"); return; }
+  try { new URL(gatewayUrl); } catch { showStatus("Invalid URL", "err"); return; }
 
   chrome.storage.local.set({ gatewayUrl, workspaceToken }, () => {
     showStatus("Saved.", "ok");
@@ -41,13 +33,9 @@ saveBtn.addEventListener("click", () => {
 function pingGateway(gatewayUrl, token) {
   const headers = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
-
   fetch(`${gatewayUrl}/health`, { headers })
-    .then((res) => {
-      if (res.ok) showStatus("Connected to gateway.", "ok");
-      else showStatus(`Gateway returned ${res.status}`, "err");
-    })
-    .catch(() => showStatus("Gateway unreachable (saved anyway).", "err"));
+    .then((res) => res.ok ? showStatus("Connected.", "ok") : showStatus(`Gateway ${res.status}`, "err"))
+    .catch(() => showStatus("Unreachable (saved anyway).", "err"));
 }
 
 function showStatus(msg, type) {
@@ -55,7 +43,7 @@ function showStatus(msg, type) {
   statusEl.className = type || "";
 }
 
-// ── Quick Compile (single page) ─────────────────────────────────
+// ── Quick Compile ───────────────────────────────────────────────
 
 document.getElementById("compile").addEventListener("click", async () => {
   const result = document.getElementById("schema-result");
@@ -63,36 +51,25 @@ document.getElementById("compile").addEventListener("click", async () => {
   showStatus("Extracting DOM...", "");
 
   const { gatewayUrl, workspaceToken } = await chrome.storage.local.get(["gatewayUrl", "workspaceToken"]);
-  if (!gatewayUrl) { showStatus("Save a Gateway URL first", "err"); return; }
+  if (!gatewayUrl) { showStatus("Save Gateway URL first", "err"); return; }
 
   let tab;
   try { [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); }
   catch (e) { showStatus("Error: " + e.message, "err"); return; }
-
-  if (!tab?.id) { showStatus("No active tab found", "err"); return; }
+  if (!tab?.id) { showStatus("No active tab", "err"); return; }
 
   let domResponse;
-  try {
-    domResponse = await chrome.tabs.sendMessage(tab.id, { type: "EXTRACT_DOM" });
-  } catch (e) {
-    showStatus("DOM extract error: " + e.message, "err");
-    return;
-  }
-
-  if (!domResponse?.success) {
-    showStatus("DOM error: " + (domResponse?.error ?? "unknown"), "err");
-    return;
-  }
+  try { domResponse = await chrome.tabs.sendMessage(tab.id, { type: "EXTRACT_DOM" }); }
+  catch (e) { showStatus("DOM error: " + e.message, "err"); return; }
+  if (!domResponse?.success) { showStatus("DOM error: " + (domResponse?.error ?? "unknown"), "err"); return; }
 
   showStatus("Compiling (AI)...", "");
-
   const headers = { "Content-Type": "application/json" };
   if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
 
   try {
     const res = await fetch(gatewayUrl + "/v1/browser/compile", {
-      method: "POST",
-      headers,
+      method: "POST", headers,
       body: JSON.stringify({
         siteUrl: tab.url,
         domSnapshots: { main: domResponse.flatTree },
@@ -102,30 +79,32 @@ document.getElementById("compile").addEventListener("click", async () => {
       }),
     });
     const data = await res.json();
-    if (!res.ok) {
-      showStatus("Compile error: " + (data.error ?? res.status), "err");
-      return;
-    }
+    if (!res.ok) { showStatus("Compile error: " + (data.error ?? res.status), "err"); return; }
     document.getElementById("schema-id").value = data.toolSchemaId;
     result.style.display = "block";
     showStatus("Compiled successfully", "ok");
-  } catch (e) {
-    showStatus("Fetch error: " + e.message, "err");
-  }
+  } catch (e) { showStatus("Fetch error: " + e.message, "err"); }
 });
 
-// ── Record & Compile (multi-page) ───────────────────────────────
+// ── Record & Compile ────────────────────────────────────────────
 
 const recordStartBtn = document.getElementById("record-start");
 const recordBar = document.getElementById("recording-bar");
 const stateCountEl = document.getElementById("state-count");
-const recordCaptureBtn = document.getElementById("record-capture");
+const actionCountEl = document.getElementById("action-count");
 const recordStopBtn = document.getElementById("record-stop");
 
-// Check if already recording on popup open
+// Check recording status on popup open
 chrome.runtime.sendMessage({ type: "GET_RECORDING_STATUS" }, (status) => {
   if (status?.active) {
     enterRecordingUI(status.stateCount);
+  }
+});
+
+// Check if recording was stopped from overlay
+chrome.runtime.sendMessage({ type: "GET_STOPPED_RESULT" }, async (result) => {
+  if (result?.success && result.states?.length > 0) {
+    await compileRecording(result.states, result.actions || []);
   }
 });
 
@@ -133,89 +112,68 @@ recordStartBtn.addEventListener("click", async () => {
   let tab;
   try { [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); }
   catch (e) { showStatus("Error: " + e.message, "err"); return; }
-
-  if (!tab?.id) { showStatus("No active tab found", "err"); return; }
+  if (!tab?.id) { showStatus("No active tab", "err"); return; }
 
   showStatus("Starting recording...", "");
-
   chrome.runtime.sendMessage({ type: "START_RECORDING", tabId: tab.id }, (result) => {
     if (result?.success) {
-      enterRecordingUI(result.stateCount);
-      showStatus("Recording started. Navigate the site, then capture states.", "ok");
+      enterRecordingUI(1);
+      showStatus("Recording. Navigate the site.", "ok");
     } else {
-      showStatus("Failed to start recording", "err");
-    }
-  });
-});
-
-recordCaptureBtn.addEventListener("click", () => {
-  showStatus("Capturing state...", "");
-
-  chrome.runtime.sendMessage({
-    type: "CAPTURE_CLICK",
-    trigger: { type: "manual_capture" },
-  }, (result) => {
-    if (result?.success) {
-      stateCountEl.textContent = result.stateCount;
-      showStatus(`State captured (${result.stateCount} total)`, "ok");
-    } else {
-      showStatus("Capture failed: " + (result?.error || "unknown"), "err");
+      showStatus("Failed: " + (result?.error || "unknown"), "err");
     }
   });
 });
 
 recordStopBtn.addEventListener("click", async () => {
-  showStatus("Stopping recording...", "");
-
+  showStatus("Stopping...", "");
   chrome.runtime.sendMessage({ type: "STOP_RECORDING" }, async (result) => {
     exitRecordingUI();
-
     if (!result?.success || !result.states?.length) {
       showStatus("No states recorded", "err");
       return;
     }
-
-    const states = result.states;
-    showStatus(`Compiling ${states.length} states (AI)...`, "");
-
-    const { gatewayUrl, workspaceToken } = await chrome.storage.local.get(["gatewayUrl", "workspaceToken"]);
-    if (!gatewayUrl) { showStatus("Save a Gateway URL first", "err"); return; }
-
-    const headers = { "Content-Type": "application/json" };
-    if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
-
-    const siteUrl = states[0]?.url || "unknown";
-
-    try {
-      const res = await fetch(gatewayUrl + "/v1/browser/compile", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          siteUrl,
-          recording: true,
-          states,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        showStatus("Compile error: " + (data.error ?? res.status), "err");
-        return;
-      }
-      document.getElementById("schema-id").value = data.toolSchemaId;
-      document.getElementById("schema-result").style.display = "block";
-      showStatus(`Compiled ${states.length} states successfully`, "ok");
-    } catch (e) {
-      showStatus("Fetch error: " + e.message, "err");
-    }
+    await compileRecording(result.states, result.actions || []);
   });
 });
+
+async function compileRecording(states, actions) {
+  showStatus(`Compiling ${states.length} states, ${actions.length} actions (AI)...`, "");
+
+  const { gatewayUrl, workspaceToken } = await chrome.storage.local.get(["gatewayUrl", "workspaceToken"]);
+  if (!gatewayUrl) { showStatus("Save Gateway URL first", "err"); return; }
+
+  const headers = { "Content-Type": "application/json" };
+  if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
+
+  try {
+    const res = await fetch(gatewayUrl + "/v1/browser/compile", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        siteUrl: states[0]?.url || "unknown",
+        recording: true,
+        states,
+        actions,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) { showStatus("Compile error: " + (data.error ?? res.status), "err"); return; }
+    document.getElementById("schema-id").value = data.toolSchemaId;
+    document.getElementById("schema-result").style.display = "block";
+    showStatus(`Compiled ${states.length} states`, "ok");
+  } catch (e) { showStatus("Fetch error: " + e.message, "err"); }
+}
 
 function enterRecordingUI(stateCount) {
   recordStartBtn.disabled = true;
   recordStartBtn.style.display = "none";
   recordBar.classList.add("active");
   stateCountEl.textContent = stateCount || 0;
+  actionCountEl.textContent = "0";
   document.getElementById("compile").disabled = true;
+
+  // Poll for live counts
+  _startCountPoller();
 }
 
 function exitRecordingUI() {
@@ -223,4 +181,22 @@ function exitRecordingUI() {
   recordStartBtn.style.display = "block";
   recordBar.classList.remove("active");
   document.getElementById("compile").disabled = false;
+  _stopCountPoller();
+}
+
+let _countPoller = null;
+function _startCountPoller() {
+  _stopCountPoller();
+  _countPoller = setInterval(() => {
+    chrome.storage.session.get(["cffbrw_meta", "cffbrw_actions"], (result) => {
+      const meta = result.cffbrw_meta;
+      const actions = result.cffbrw_actions;
+      if (meta) stateCountEl.textContent = meta.stateCount || 0;
+      if (actions) actionCountEl.textContent = actions.length || 0;
+    });
+  }, 1000);
+}
+
+function _stopCountPoller() {
+  if (_countPoller) { clearInterval(_countPoller); _countPoller = null; }
 }

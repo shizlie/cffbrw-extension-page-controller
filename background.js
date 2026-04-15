@@ -2,19 +2,17 @@
  * CFFBRW Browser Bridge — Background Service Worker (v2)
  *
  * Two modes:
- *   1. Polling: GET /v1/browser/pending-actions every 2s for browser_action steps
- *   2. Recording: captures page states as user navigates for multi-page compilation
+ *   1. Polling: GET /v1/browser/pending-actions every 2s
+ *   2. Recording relay: forwards messages between popup ↔ content script
  *
- * v2 additions:
- *   - Recording mode: START_RECORDING / STOP_RECORDING / CAPTURE_CLICK messages
- *   - State management in chrome.storage.session for recording states
- *   - Tab navigation listener to auto-capture states during recording
+ * Recording state lives in chrome.storage.session (survives SW restart).
+ * This file is a thin relay — recorder.js in content script owns the logic.
  */
 
 const ALARM_NAME = "cffbrw-poll";
 const POLL_INTERVAL_MINUTES = 2 / 60; // ~2s in dev
 
-// ── Install: set defaults + start alarm ─────────────────────────
+// ── Install ─────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(["gatewayUrl", "workspaceToken"], (result) => {
@@ -22,6 +20,8 @@ chrome.runtime.onInstalled.addListener(() => {
       chrome.storage.local.set({ gatewayUrl: "http://localhost:8787" });
     }
   });
+  // Unlock full 10MB session storage (default is 1MB per item)
+  chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS" });
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: POLL_INTERVAL_MINUTES });
   console.log("[cffbrw] installed, polling started");
 });
@@ -35,134 +35,110 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) pollPendingActions();
 });
 
-// ── Recording state ─────────────────────────────────────────────
-
-let recordingActive = false;
-let recordingStates = [];
-let recordingTabId = null;
-
-// ── Message handler (popup + content script) ────────────────────
+// ── Message relay ───────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Recording: relay popup commands to active tab's content script
   if (message.type === "START_RECORDING") {
-    startRecording(message.tabId).then(sendResponse);
+    relayToTab(message.tabId, { type: "START_RECORDING" }, sendResponse);
     return true;
   }
 
   if (message.type === "STOP_RECORDING") {
-    const states = stopRecording();
-    sendResponse({ success: true, states, count: states.length });
-    return false;
+    getRecordingTabId().then((tabId) => {
+      if (!tabId) { sendResponse({ success: false, error: "No recording tab" }); return; }
+      relayToTab(tabId, { type: "STOP_RECORDING" }, sendResponse);
+    });
+    return true;
   }
 
-  if (message.type === "GET_RECORDING_STATUS") {
-    sendResponse({
-      active: recordingActive,
-      stateCount: recordingStates.length,
-      tabId: recordingTabId,
+  if (message.type === "CAPTURE_MANUAL") {
+    getRecordingTabId().then((tabId) => {
+      if (!tabId) { sendResponse({ success: false, error: "No recording tab" }); return; }
+      relayToTab(tabId, { type: "CAPTURE_MANUAL" }, sendResponse);
+    });
+    return true;
+  }
+
+  if (message.type === "STOP_FROM_OVERLAY") {
+    // Overlay stop button clicked — relay to popup
+    // Content script will handle STOP_RECORDING when popup sends it
+    // For now, just stop directly
+    getRecordingTabId().then((tabId) => {
+      if (!tabId) return;
+      chrome.tabs.sendMessage(tabId, { type: "STOP_RECORDING" }, (result) => {
+        if (result?.success && result.states?.length > 0) {
+          // Store for popup to pick up and compile
+          chrome.storage.session.set({ cffbrw_stopped_result: result });
+        }
+      });
     });
     return false;
   }
 
-  if (message.type === "CAPTURE_CLICK") {
-    if (recordingActive) {
-      captureRecordingState(message.trigger || { type: "click" }).then(sendResponse);
-      return true;
+  if (message.type === "GET_RECORDING_STATUS") {
+    chrome.storage.session.get("cffbrw_meta", (result) => {
+      const meta = result.cffbrw_meta;
+      sendResponse({
+        active: meta?.active || false,
+        stateCount: meta?.stateCount || 0,
+        tabId: meta?.tabId || null,
+      });
+    });
+    return true;
+  }
+
+  if (message.type === "RECORDING_STATE_CAPTURED") {
+    // Content script notifying us of state capture — update meta with tabId
+    if (sender.tab?.id) {
+      chrome.storage.session.get("cffbrw_meta", (result) => {
+        const meta = result.cffbrw_meta || {};
+        meta.tabId = sender.tab.id;
+        chrome.storage.session.set({ cffbrw_meta: meta });
+      });
     }
-    sendResponse({ success: false, error: "Not recording" });
     return false;
   }
 
-  if (message.type === "ADD_INTENT") {
-    if (recordingStates.length > 0 && message.stateIndex < recordingStates.length) {
-      recordingStates[message.stateIndex].intent = message.intent;
-      sendResponse({ success: true });
-    } else {
-      sendResponse({ success: false, error: "Invalid state index" });
-    }
-    return false;
+  if (message.type === "GET_STOPPED_RESULT") {
+    chrome.storage.session.get("cffbrw_stopped_result", (result) => {
+      const stopped = result.cffbrw_stopped_result || null;
+      if (stopped) chrome.storage.session.remove("cffbrw_stopped_result");
+      sendResponse(stopped);
+    });
+    return true;
   }
 
   return false;
 });
 
-// ── Recording lifecycle ─────────────────────────────────────────
-
-async function startRecording(tabId) {
-  recordingActive = true;
-  recordingStates = [];
-  recordingTabId = tabId;
-
-  // Capture initial state
-  const result = await captureRecordingState({ type: "initial" });
-  return { success: true, stateCount: recordingStates.length };
-}
-
-function stopRecording() {
-  recordingActive = false;
-  const states = [...recordingStates];
-  recordingStates = [];
-  const tabId = recordingTabId;
-  recordingTabId = null;
-  return states;
-}
-
-async function captureRecordingState(trigger) {
-  if (!recordingTabId) return { success: false, error: "No recording tab" };
-
-  // Cap at 20 states (backend limit)
-  if (recordingStates.length >= 20) {
-    return { success: false, error: "Max 20 states reached" };
-  }
-
+async function relayToTab(tabId, message, sendResponse) {
   try {
-    const response = await chrome.tabs.sendMessage(recordingTabId, {
-      type: "CAPTURE_STATE",
-      trigger,
-    });
-
-    if (response?.success && response.state) {
-      recordingStates.push(response.state);
-      return { success: true, stateCount: recordingStates.length, state: response.state };
-    }
-    return { success: false, error: response?.error || "Capture failed" };
+    const response = await chrome.tabs.sendMessage(tabId, message);
+    sendResponse(response);
   } catch (err) {
-    // Content script might not be loaded — inject and retry
+    // Try injecting content scripts first
     try {
       await chrome.scripting.executeScript({
-        target: { tabId: recordingTabId },
-        files: ["page-controller.bundle.js", "content.js"],
+        target: { tabId },
+        files: ["page-controller.bundle.js", "overlay.js", "recorder.js", "content.js"],
       });
-      const response = await chrome.tabs.sendMessage(recordingTabId, {
-        type: "CAPTURE_STATE",
-        trigger,
-      });
-      if (response?.success && response.state) {
-        recordingStates.push(response.state);
-        return { success: true, stateCount: recordingStates.length };
-      }
-      return { success: false, error: response?.error || "Capture failed after inject" };
+      const response = await chrome.tabs.sendMessage(tabId, message);
+      sendResponse(response);
     } catch (retryErr) {
-      return { success: false, error: `Capture error: ${retryErr.message}` };
+      sendResponse({ success: false, error: `Content script error: ${retryErr.message}` });
     }
   }
 }
 
-// ── Auto-capture on tab navigation during recording ─────────────
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!recordingActive || tabId !== recordingTabId) return;
-  if (changeInfo.status !== "complete") return;
-
-  // Small delay to let content scripts load
-  setTimeout(() => {
-    captureRecordingState({ type: "navigation" }).then((result) => {
-      if (result.success) {
-        console.log(`[cffbrw] auto-captured navigation state (${result.stateCount} total)`);
-      }
-    });
-  }, 500);
-});
+async function getRecordingTabId() {
+  const result = await chrome.storage.session.get("cffbrw_meta");
+  const meta = result.cffbrw_meta;
+  if (meta?.tabId) return meta.tabId;
+  // Fallback: active tab
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs[0]?.id || null;
+}
 
 // ── Poll for paused browser_action steps ────────────────────────
 
@@ -187,9 +163,8 @@ async function pollPendingActions() {
   if (actions.length === 0) return;
 
   let tabs;
-  try {
-    tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  } catch { return; }
+  try { tabs = await chrome.tabs.query({ active: true, currentWindow: true }); }
+  catch { return; }
 
   const activeTab = tabs[0];
   if (!activeTab?.id) return;
@@ -199,39 +174,29 @@ async function pollPendingActions() {
   }
 }
 
-// ── Execute a browser action ────────────────────────────────────
-
 async function dispatchAction(action, tabId, gatewayUrl, workspaceToken) {
   const { runId, stepIndex, toolSchema, toolName, params } = action;
 
   let response;
   try {
     response = await chrome.tabs.sendMessage(tabId, {
-      type: "EXECUTE_TOOL",
-      toolSchema,
-      toolName,
-      params,
+      type: "EXECUTE_TOOL", toolSchema, toolName, params,
     });
   } catch (err) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        files: ["page-controller.bundle.js", "content.js"],
+        files: ["page-controller.bundle.js", "overlay.js", "recorder.js", "content.js"],
       });
       response = await chrome.tabs.sendMessage(tabId, {
-        type: "EXECUTE_TOOL",
-        toolSchema,
-        toolName,
-        params,
+        type: "EXECUTE_TOOL", toolSchema, toolName, params,
       });
     } catch (retryErr) {
       response = { success: false, error: `Content script error: ${retryErr.message}` };
     }
   }
 
-  if (!response) {
-    response = { success: false, error: "No response from content script" };
-  }
+  if (!response) response = { success: false, error: "No response from content script" };
 
   await postBrowserResult(gatewayUrl, workspaceToken, runId, stepIndex, response);
 }
@@ -240,22 +205,16 @@ async function postBrowserResult(gatewayUrl, workspaceToken, runId, stepIndex, r
   try {
     const headers = { "Content-Type": "application/json" };
     if (workspaceToken) headers["Authorization"] = `Bearer ${workspaceToken}`;
-
     const res = await fetch(`${gatewayUrl}/v1/runs/${runId}/browser-result/${stepIndex}`, {
-      method: "POST",
-      headers,
+      method: "POST", headers,
       body: JSON.stringify({
         success: result.success ?? false,
         output: result.output ?? null,
         error: result.error ?? undefined,
       }),
     });
-
-    if (!res.ok) {
-      console.warn(`[cffbrw] browser result POST failed: ${res.status}`);
-    } else {
-      console.log(`[cffbrw] browser action completed: run=${runId} step=${stepIndex} success=${result.success}`);
-    }
+    if (!res.ok) console.warn(`[cffbrw] browser result POST failed: ${res.status}`);
+    else console.log(`[cffbrw] action done: run=${runId} step=${stepIndex} ok=${result.success}`);
   } catch (err) {
     console.warn(`[cffbrw] failed to post browser result:`, err);
   }
