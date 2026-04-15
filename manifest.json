@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "CFFBRW Browser Bridge",
+  "version": "0.1.0",
+  "description": "Connects CFFBRW workflows to the active browser tab",
+  "permissions": ["storage", "activeTab", "scripting", "alarms", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html" },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["page-controller.bundle.js", "content.js"],
+    "run_at": "document_idle"
+  }]
+}

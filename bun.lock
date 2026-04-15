@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "cffbrw-extension-page-controller",
+      "dependencies": {
+        "@page-agent/page-controller": "^1.7.1",
+      },
+    },
+  },
+  "packages": {
+    "@page-agent/page-controller": ["@page-agent/page-controller@1.7.1", "", { "dependencies": { "ai-motion": "^0.4.8" } }, "sha512-8Ciqsqv46gRUV4t8R1lQdl+hIK3cOpU522zvP5xwFpsbPFYTzu8EnITfxqOjVkPIBqhuVH10N7xC38J2gXupCA=="],
+
+    "ai-motion": ["ai-motion@0.4.8", "", {}, "sha512-9nQVjf8lrYQWSW0sZdb9bES4x8Ei1w9C0S62po2KvRbMjslmjm0WMeszyW771SEauDnu4YGWqurLZ/gCkCTosQ=="],
+  }
+}

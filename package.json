@@ -1,0 +1,11 @@
+{
+  "name": "cffbrw-extension-page-controller",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bundle": "bun build ./entry.js --outfile=page-controller.bundle.js --format=iife"
+  },
+  "dependencies": {
+    "@page-agent/page-controller": "^1.7.1"
+  }
+}
