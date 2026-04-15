@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CFFBRW Browser Bridge",
-  "version": "0.1.0",
-  "description": "Connects CFFBRW workflows to the active browser tab",
+  "version": "0.2.0",
+  "description": "Connects CFFBRW workflows to the active browser tab — multi-page recording, 7-tier selector strategies",
   "permissions": ["storage", "activeTab", "scripting", "alarms", "tabs"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },

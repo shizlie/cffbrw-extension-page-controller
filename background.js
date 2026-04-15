@@ -1,9 +1,14 @@
 /**
- * CFFBRW Browser Bridge — Background Service Worker
+ * CFFBRW Browser Bridge — Background Service Worker (v2)
  *
- * Polls GET /v1/browser/pending-actions every 2s for browser_action steps
- * that are paused in active workflow runs. When found, dispatches to content
- * script for execution, then POSTs result back to resume the workflow.
+ * Two modes:
+ *   1. Polling: GET /v1/browser/pending-actions every 2s for browser_action steps
+ *   2. Recording: captures page states as user navigates for multi-page compilation
+ *
+ * v2 additions:
+ *   - Recording mode: START_RECORDING / STOP_RECORDING / CAPTURE_CLICK messages
+ *   - State management in chrome.storage.session for recording states
+ *   - Tab navigation listener to auto-capture states during recording
  */
 
 const ALARM_NAME = "cffbrw-poll";
@@ -28,6 +33,135 @@ chrome.alarms.get(ALARM_NAME, (alarm) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) pollPendingActions();
+});
+
+// ── Recording state ─────────────────────────────────────────────
+
+let recordingActive = false;
+let recordingStates = [];
+let recordingTabId = null;
+
+// ── Message handler (popup + content script) ────────────────────
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "START_RECORDING") {
+    startRecording(message.tabId).then(sendResponse);
+    return true;
+  }
+
+  if (message.type === "STOP_RECORDING") {
+    const states = stopRecording();
+    sendResponse({ success: true, states, count: states.length });
+    return false;
+  }
+
+  if (message.type === "GET_RECORDING_STATUS") {
+    sendResponse({
+      active: recordingActive,
+      stateCount: recordingStates.length,
+      tabId: recordingTabId,
+    });
+    return false;
+  }
+
+  if (message.type === "CAPTURE_CLICK") {
+    if (recordingActive) {
+      captureRecordingState(message.trigger || { type: "click" }).then(sendResponse);
+      return true;
+    }
+    sendResponse({ success: false, error: "Not recording" });
+    return false;
+  }
+
+  if (message.type === "ADD_INTENT") {
+    if (recordingStates.length > 0 && message.stateIndex < recordingStates.length) {
+      recordingStates[message.stateIndex].intent = message.intent;
+      sendResponse({ success: true });
+    } else {
+      sendResponse({ success: false, error: "Invalid state index" });
+    }
+    return false;
+  }
+
+  return false;
+});
+
+// ── Recording lifecycle ─────────────────────────────────────────
+
+async function startRecording(tabId) {
+  recordingActive = true;
+  recordingStates = [];
+  recordingTabId = tabId;
+
+  // Capture initial state
+  const result = await captureRecordingState({ type: "initial" });
+  return { success: true, stateCount: recordingStates.length };
+}
+
+function stopRecording() {
+  recordingActive = false;
+  const states = [...recordingStates];
+  recordingStates = [];
+  const tabId = recordingTabId;
+  recordingTabId = null;
+  return states;
+}
+
+async function captureRecordingState(trigger) {
+  if (!recordingTabId) return { success: false, error: "No recording tab" };
+
+  // Cap at 20 states (backend limit)
+  if (recordingStates.length >= 20) {
+    return { success: false, error: "Max 20 states reached" };
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(recordingTabId, {
+      type: "CAPTURE_STATE",
+      trigger,
+    });
+
+    if (response?.success && response.state) {
+      recordingStates.push(response.state);
+      return { success: true, stateCount: recordingStates.length, state: response.state };
+    }
+    return { success: false, error: response?.error || "Capture failed" };
+  } catch (err) {
+    // Content script might not be loaded — inject and retry
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: recordingTabId },
+        files: ["page-controller.bundle.js", "content.js"],
+      });
+      const response = await chrome.tabs.sendMessage(recordingTabId, {
+        type: "CAPTURE_STATE",
+        trigger,
+      });
+      if (response?.success && response.state) {
+        recordingStates.push(response.state);
+        return { success: true, stateCount: recordingStates.length };
+      }
+      return { success: false, error: response?.error || "Capture failed after inject" };
+    } catch (retryErr) {
+      return { success: false, error: `Capture error: ${retryErr.message}` };
+    }
+  }
+}
+
+// ── Auto-capture on tab navigation during recording ─────────────
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!recordingActive || tabId !== recordingTabId) return;
+  if (changeInfo.status !== "complete") return;
+
+  // Small delay to let content scripts load
+  setTimeout(() => {
+    captureRecordingState({ type: "navigation" }).then((result) => {
+      if (result.success) {
+        console.log(`[cffbrw] auto-captured navigation state (${result.stateCount} total)`);
+      }
+    });
+  }, 500);
 });
 
 // ── Poll for paused browser_action steps ────────────────────────
@@ -70,7 +204,6 @@ async function pollPendingActions() {
 async function dispatchAction(action, tabId, gatewayUrl, workspaceToken) {
   const { runId, stepIndex, toolSchema, toolName, params } = action;
 
-  // Send to content script for execution
   let response;
   try {
     response = await chrome.tabs.sendMessage(tabId, {
@@ -80,7 +213,6 @@ async function dispatchAction(action, tabId, gatewayUrl, workspaceToken) {
       params,
     });
   } catch (err) {
-    // Try injecting content script first
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
@@ -101,7 +233,6 @@ async function dispatchAction(action, tabId, gatewayUrl, workspaceToken) {
     response = { success: false, error: "No response from content script" };
   }
 
-  // POST result back to resume the workflow step
   await postBrowserResult(gatewayUrl, workspaceToken, runId, stepIndex, response);
 }
 
