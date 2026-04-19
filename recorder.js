@@ -43,16 +43,20 @@ let _lastClickIndex = -1;
 
 window.CffbrwRecorder = {
   async startRecording() {
+    // Clear any stale state from a prior aborted recording
+    await _clearRecordingData();
+    await _persistMeta({ active: true, stateCount: 0, tabId: null });
+
     await _initController();
     // Show overlay FIRST so subsequent updateCount calls have a target
     if (typeof CffbrwOverlay !== "undefined") {
       CffbrwOverlay.show();
       CffbrwOverlay.updateCount(0, 0);
     }
+    // _captureState merges into meta (preserves active flag) and increments stateCount
     await _captureState({ type: "initial" });
     _attachListeners();
     _startObserver();
-    await _persistMeta({ active: true, tabId: null });
     return { success: true };
   },
 
