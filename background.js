@@ -61,19 +61,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "STOP_FROM_OVERLAY") {
-    // Overlay stop button clicked — relay to popup
-    // Content script will handle STOP_RECORDING when popup sends it
-    // For now, just stop directly
+    // Overlay stop button — stop + compile via background (survives popup close)
     getRecordingTabId().then((tabId) => {
       if (!tabId) return;
-      chrome.tabs.sendMessage(tabId, { type: "STOP_RECORDING" }, (result) => {
-        if (result?.success && result.states?.length > 0) {
-          // Store for popup to pick up and compile
-          chrome.storage.session.set({ cffbrw_stopped_result: result });
-        }
-      });
+      stopAndCompileRecording(tabId);
     });
     return false;
+  }
+
+  if (message.type === "STOP_AND_COMPILE") {
+    // Popup stop button — same flow, but can optionally wait
+    getRecordingTabId().then((tabId) => {
+      if (!tabId) { sendResponse({ success: false, error: "No recording tab" }); return; }
+      stopAndCompileRecording(tabId);
+      sendResponse({ success: true, started: true }); // returns immediately
+    });
+    return true;
+  }
+
+  if (message.type === "COMPILE_QUICK") {
+    // Popup "Compile current page" — run via background
+    getActiveTabId().then((tabId) => {
+      if (!tabId) { sendResponse({ success: false, error: "No active tab" }); return; }
+      compileQuick(tabId);
+      sendResponse({ success: true, started: true });
+    });
+    return true;
   }
 
   if (message.type === "GET_RECORDING_STATUS") {
@@ -100,17 +113,141 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
-  if (message.type === "GET_STOPPED_RESULT") {
-    chrome.storage.session.get("cffbrw_stopped_result", (result) => {
-      const stopped = result.cffbrw_stopped_result || null;
-      if (stopped) chrome.storage.session.remove("cffbrw_stopped_result");
-      sendResponse(stopped);
-    });
-    return true;
-  }
-
   return false;
 });
+
+// ── Compile orchestration (survives popup close) ────────────────
+
+async function stopAndCompileRecording(tabId) {
+  await setCompileStatus({ state: "stopping", mode: "recording" });
+  let stopped;
+  try {
+    stopped = await chrome.tabs.sendMessage(tabId, { type: "STOP_RECORDING" });
+  } catch (e) {
+    await setCompileStatus({ state: "error", error: "Stop failed: " + e.message });
+    notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: "Stop failed" });
+    return;
+  }
+  if (!stopped?.success || !stopped.states?.length) {
+    await setCompileStatus({ state: "error", error: "No states recorded" });
+    notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: "No states" });
+    return;
+  }
+
+  await setCompileStatus({
+    state: "compiling",
+    mode: "recording",
+    stateCount: stopped.states.length,
+    actionCount: stopped.actions?.length || 0,
+  });
+  notifyOverlay(tabId, {
+    type: "COMPILE_UPDATE", state: "compiling",
+    stateCount: stopped.states.length, actionCount: stopped.actions?.length || 0,
+  });
+
+  const { gatewayUrl, workspaceToken } = await chrome.storage.local.get(["gatewayUrl", "workspaceToken"]);
+  const headers = { "Content-Type": "application/json" };
+  if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
+  const siteUrl = stopped.states[0]?.url || "unknown";
+
+  try {
+    const res = await fetch(gatewayUrl + "/v1/browser/compile", {
+      method: "POST", headers,
+      body: JSON.stringify({ siteUrl, recording: true, states: stopped.states, actions: stopped.actions }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      await setCompileStatus({ state: "error", error: data.error || ("HTTP " + res.status) });
+      notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: data.error || "HTTP " + res.status });
+      return;
+    }
+    await persistLastSchema({ id: data.toolSchemaId, siteUrl, mode: "recording", compiledAt: data.compiledAt, tools: data.tools });
+    await setCompileStatus({ state: "done", toolSchemaId: data.toolSchemaId });
+    notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "done", toolSchemaId: data.toolSchemaId, toolCount: (data.tools || []).length });
+  } catch (e) {
+    await setCompileStatus({ state: "error", error: e.message });
+    notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: e.message });
+  }
+}
+
+async function compileQuick(tabId) {
+  await setCompileStatus({ state: "extracting", mode: "quick" });
+  notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "extracting" });
+
+  let dom;
+  try {
+    dom = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_DOM" });
+  } catch (e) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["page-controller.bundle.js", "overlay.js", "recorder.js", "content.js"],
+      });
+      dom = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_DOM" });
+    } catch (retryErr) {
+      await setCompileStatus({ state: "error", error: "DOM extract: " + retryErr.message });
+      return;
+    }
+  }
+  if (!dom?.success) {
+    await setCompileStatus({ state: "error", error: dom?.error || "DOM extract failed" });
+    return;
+  }
+
+  await setCompileStatus({ state: "compiling", mode: "quick" });
+  notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "compiling" });
+
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const { gatewayUrl, workspaceToken } = await chrome.storage.local.get(["gatewayUrl", "workspaceToken"]);
+  const headers = { "Content-Type": "application/json" };
+  if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
+
+  try {
+    const res = await fetch(gatewayUrl + "/v1/browser/compile", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        siteUrl: tab?.url || dom.url,
+        domSnapshots: { main: dom.flatTree },
+        selectorLookup: dom.selectorLookup || {},
+        selectorStrategies: dom.selectorStrategies,
+        verifyProps: dom.verifyProps,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      await setCompileStatus({ state: "error", error: data.error || ("HTTP " + res.status) });
+      return;
+    }
+    await persistLastSchema({ id: data.toolSchemaId, siteUrl: data.siteUrl, mode: "quick", compiledAt: data.compiledAt, tools: data.tools });
+    await setCompileStatus({ state: "done", toolSchemaId: data.toolSchemaId });
+    notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "done", toolSchemaId: data.toolSchemaId, toolCount: (data.tools || []).length });
+  } catch (e) {
+    await setCompileStatus({ state: "error", error: e.message });
+  }
+}
+
+async function getActiveTabId() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs[0]?.id || null;
+}
+
+async function setCompileStatus(status) {
+  await chrome.storage.session.set({
+    cffbrw_compile_status: { ...status, at: Date.now() },
+  });
+}
+
+async function persistLastSchema(info) {
+  await chrome.storage.local.set({
+    cffbrw_last_schema: { ...info, at: Date.now() },
+  });
+}
+
+function notifyOverlay(tabId, message) {
+  chrome.tabs.sendMessage(tabId, message).catch(() => {});
+}
+
+// ── Message relay ─────────────────────────────────────────────
 
 async function relayToTab(tabId, message, sendResponse) {
   try {

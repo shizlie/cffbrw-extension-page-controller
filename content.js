@@ -80,6 +80,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "COMPILE_UPDATE") {
+    if (typeof CffbrwOverlay !== "undefined") {
+      CffbrwOverlay.setCompileStatus(message);
+    }
+    return false;
+  }
+
   return false;
 });
 

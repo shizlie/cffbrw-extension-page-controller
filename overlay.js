@@ -87,6 +87,45 @@ window.CffbrwOverlay = {
       toastEl.style.opacity = "0";
     }, 2000);
   },
+
+  // Show compile lifecycle: extracting → compiling → done / error.
+  // Keeps overlay visible throughout so user sees progress even with popup closed.
+  setCompileStatus(update) {
+    // Auto-create overlay if not yet shown (quick compile from closed popup)
+    if (!_panel) _createPanel();
+    if (!_panel) return;
+
+    const header = _shadowRoot.querySelector(".cffbrw-title");
+    const dot = _shadowRoot.querySelector(".cffbrw-dot");
+    const buttons = _shadowRoot.querySelector(".cffbrw-buttons");
+
+    if (update.state === "stopping") {
+      if (header) header.textContent = "Stopping...";
+      if (buttons) buttons.style.display = "none";
+    } else if (update.state === "extracting") {
+      if (header) header.textContent = "Extracting DOM...";
+      if (dot) dot.style.background = "#f59e0b";
+      if (buttons) buttons.style.display = "none";
+    } else if (update.state === "compiling") {
+      if (header) header.textContent = "Compiling (AI)...";
+      if (dot) dot.style.background = "#f59e0b";
+      if (buttons) buttons.style.display = "none";
+      this.logEntry(`→ Sent ${update.stateCount || "?"} states, ${update.actionCount || "?"} actions to compiler`);
+    } else if (update.state === "done") {
+      if (header) header.textContent = "Compiled ✓";
+      if (dot) dot.style.background = "#22c55e";
+      if (buttons) buttons.style.display = "none";
+      this.logEntry(`✓ Schema: ${update.toolSchemaId} (${update.toolCount || 0} tools)`);
+      // Auto-hide after 10s
+      setTimeout(() => this.hide(), 10000);
+    } else if (update.state === "error") {
+      if (header) header.textContent = "Compile failed";
+      if (dot) dot.style.background = "#ef4444";
+      if (buttons) buttons.style.display = "none";
+      this.logEntry(`✗ Error: ${update.error}`);
+      setTimeout(() => this.hide(), 15000);
+    }
+  },
 };
 
 function _createPanel() {

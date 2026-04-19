@@ -43,48 +43,80 @@ function showStatus(msg, type) {
   statusEl.className = type || "";
 }
 
-// ── Quick Compile ───────────────────────────────────────────────
+// ── Quick Compile (runs in background, survives popup close) ────
 
 document.getElementById("compile").addEventListener("click", async () => {
   const result = document.getElementById("schema-result");
   result.style.display = "none";
-  showStatus("Extracting DOM...", "");
+  showStatus("Starting compile in background...", "");
 
-  const { gatewayUrl, workspaceToken } = await chrome.storage.local.get(["gatewayUrl", "workspaceToken"]);
+  const { gatewayUrl } = await chrome.storage.local.get("gatewayUrl");
   if (!gatewayUrl) { showStatus("Save Gateway URL first", "err"); return; }
 
-  let tab;
-  try { [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); }
-  catch (e) { showStatus("Error: " + e.message, "err"); return; }
-  if (!tab?.id) { showStatus("No active tab", "err"); return; }
-
-  let domResponse;
-  try { domResponse = await chrome.tabs.sendMessage(tab.id, { type: "EXTRACT_DOM" }); }
-  catch (e) { showStatus("DOM error: " + e.message, "err"); return; }
-  if (!domResponse?.success) { showStatus("DOM error: " + (domResponse?.error ?? "unknown"), "err"); return; }
-
-  showStatus("Compiling (AI)...", "");
-  const headers = { "Content-Type": "application/json" };
-  if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
-
-  try {
-    const res = await fetch(gatewayUrl + "/v1/browser/compile", {
-      method: "POST", headers,
-      body: JSON.stringify({
-        siteUrl: tab.url,
-        domSnapshots: { main: domResponse.flatTree },
-        selectorLookup: domResponse.selectorLookup || {},
-        selectorStrategies: domResponse.selectorStrategies || undefined,
-        verifyProps: domResponse.verifyProps || undefined,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) { showStatus("Compile error: " + (data.error ?? res.status), "err"); return; }
-    document.getElementById("schema-id").value = data.toolSchemaId;
-    result.style.display = "block";
-    showStatus("Compiled successfully", "ok");
-  } catch (e) { showStatus("Fetch error: " + e.message, "err"); }
+  chrome.runtime.sendMessage({ type: "COMPILE_QUICK" }, (reply) => {
+    if (!reply?.success) { showStatus("Failed to start: " + (reply?.error || "unknown"), "err"); return; }
+    showStatus("Compiling in background. Can close popup.", "ok");
+    // Poll compile status (or re-open popup later to see result)
+    _startCompileStatusPoller();
+  });
 });
+
+// ── Last schema display (persists across popup close) ───────────
+
+async function loadLastSchema() {
+  const { cffbrw_last_schema } = await chrome.storage.local.get("cffbrw_last_schema");
+  if (!cffbrw_last_schema) return;
+  const last = document.getElementById("last-schema");
+  const lastId = document.getElementById("last-schema-id");
+  const lastMeta = document.getElementById("last-schema-meta");
+  if (!last) return;
+  last.style.display = "block";
+  lastId.value = cffbrw_last_schema.id;
+  const ageMs = Date.now() - (cffbrw_last_schema.at || 0);
+  const ageMin = Math.floor(ageMs / 60000);
+  const ageStr = ageMin < 1 ? "just now" : ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin / 60)}h ago`;
+  const tools = Array.isArray(cffbrw_last_schema.tools) ? cffbrw_last_schema.tools.length : "?";
+  lastMeta.textContent = `${cffbrw_last_schema.mode} · ${tools} tools · ${ageStr}`;
+}
+
+// ── Compile status display (live while compile in progress) ─────
+
+let _compileStatusPoller = null;
+function _startCompileStatusPoller() {
+  _stopCompileStatusPoller();
+  _compileStatusPoller = setInterval(async () => {
+    const { cffbrw_compile_status } = await chrome.storage.session.get("cffbrw_compile_status");
+    if (!cffbrw_compile_status) return;
+    const label = {
+      stopping: "Stopping...",
+      extracting: "Extracting DOM...",
+      compiling: "Compiling (AI)...",
+      done: "Done",
+      error: "Error: " + (cffbrw_compile_status.error || ""),
+    }[cffbrw_compile_status.state] || cffbrw_compile_status.state;
+    showStatus(label, cffbrw_compile_status.state === "error" ? "err" : "ok");
+    if (cffbrw_compile_status.state === "done") {
+      document.getElementById("schema-id").value = cffbrw_compile_status.toolSchemaId;
+      document.getElementById("schema-result").style.display = "block";
+      loadLastSchema();
+      _stopCompileStatusPoller();
+    } else if (cffbrw_compile_status.state === "error") {
+      _stopCompileStatusPoller();
+    }
+  }, 1000);
+}
+function _stopCompileStatusPoller() {
+  if (_compileStatusPoller) { clearInterval(_compileStatusPoller); _compileStatusPoller = null; }
+}
+
+// On popup open, check if compile already in progress or done
+(async () => {
+  await loadLastSchema();
+  const { cffbrw_compile_status } = await chrome.storage.session.get("cffbrw_compile_status");
+  if (cffbrw_compile_status && ["stopping", "extracting", "compiling"].includes(cffbrw_compile_status.state)) {
+    _startCompileStatusPoller();
+  }
+})();
 
 // ── Record & Compile ────────────────────────────────────────────
 
@@ -101,12 +133,8 @@ chrome.runtime.sendMessage({ type: "GET_RECORDING_STATUS" }, (status) => {
   }
 });
 
-// Check if recording was stopped from overlay
-chrome.runtime.sendMessage({ type: "GET_STOPPED_RESULT" }, async (result) => {
-  if (result?.success && result.states?.length > 0) {
-    await compileRecording(result.states, result.actions || []);
-  }
-});
+// (stopped-from-overlay result is now handled via compile status poller
+//  since background.js runs the full stop→compile flow directly.)
 
 recordStartBtn.addEventListener("click", async () => {
   let tab;
@@ -126,43 +154,14 @@ recordStartBtn.addEventListener("click", async () => {
 });
 
 recordStopBtn.addEventListener("click", async () => {
-  showStatus("Stopping...", "");
-  chrome.runtime.sendMessage({ type: "STOP_RECORDING" }, async (result) => {
+  showStatus("Stopping & compiling in background...", "");
+  chrome.runtime.sendMessage({ type: "STOP_AND_COMPILE" }, (reply) => {
     exitRecordingUI();
-    if (!result?.success || !result.states?.length) {
-      showStatus("No states recorded", "err");
-      return;
-    }
-    await compileRecording(result.states, result.actions || []);
+    if (!reply?.success) { showStatus("Failed: " + (reply?.error || "unknown"), "err"); return; }
+    showStatus("Compiling in background. Can close popup.", "ok");
+    _startCompileStatusPoller();
   });
 });
-
-async function compileRecording(states, actions) {
-  showStatus(`Compiling ${states.length} states, ${actions.length} actions (AI)...`, "");
-
-  const { gatewayUrl, workspaceToken } = await chrome.storage.local.get(["gatewayUrl", "workspaceToken"]);
-  if (!gatewayUrl) { showStatus("Save Gateway URL first", "err"); return; }
-
-  const headers = { "Content-Type": "application/json" };
-  if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
-
-  try {
-    const res = await fetch(gatewayUrl + "/v1/browser/compile", {
-      method: "POST", headers,
-      body: JSON.stringify({
-        siteUrl: states[0]?.url || "unknown",
-        recording: true,
-        states,
-        actions,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) { showStatus("Compile error: " + (data.error ?? res.status), "err"); return; }
-    document.getElementById("schema-id").value = data.toolSchemaId;
-    document.getElementById("schema-result").style.display = "block";
-    showStatus(`Compiled ${states.length} states`, "ok");
-  } catch (e) { showStatus("Fetch error: " + e.message, "err"); }
-}
 
 function enterRecordingUI(stateCount) {
   recordStartBtn.disabled = true;
