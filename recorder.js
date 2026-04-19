@@ -931,13 +931,16 @@ function _extractVaryingPart(values) {
 }
 
 function _inferParamName(prefix, suffix) {
-  // Try to extract a meaningful noun from prefix like "delete-contact-" → "contactId"
+  // Extract meaningful noun from prefix/suffix, produce snake_case to match
+  // compiler prompt convention (AI outputs snake_case input names).
+  // "delete-contact-" → "contact_id"
   const clean = (prefix + suffix).replace(/[^a-zA-Z0-9]+/g, " ").trim().split(/\s+/);
   if (clean.length === 0) return null;
-  // Last word is most likely the entity name
   const entity = clean[clean.length - 1];
   if (!entity || entity.length < 2) return null;
-  return entity + "Id";
+  // Normalize entity to snake_case: "ContactName" → "contact_name"
+  const snake = entity.replace(/([A-Z])/g, (_, c, i) => (i ? "_" : "") + c.toLowerCase());
+  return snake + "_id";
 }
 
 function _getColumnHeaders(table) {
