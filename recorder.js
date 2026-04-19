@@ -413,7 +413,14 @@ async function _captureState(trigger) {
   await chrome.storage.session.set({
     [STATES_PREFIX + newIndex]: recordingState,
   });
-  await _persistMeta({ ...meta, active: true, stateCount: newIndex + 1 });
+  // Track lastCapturedCount so _ensureIndexed's delta check has a baseline.
+  // Without this, first re-index always fires (lastCount=0 vs real count=N > 3).
+  await _persistMeta({
+    ...meta,
+    active: true,
+    stateCount: newIndex + 1,
+    lastCapturedCount: _lastInteractiveCount,
+  });
 
   // Check storage size
   const bytesUsed = await chrome.storage.session.getBytesInUse(null);
@@ -658,22 +665,32 @@ function _findElementIndex(el) {
 }
 
 // If the target element isn't in the current selectorMap, DOM has grown
-// (e.g., modal just opened). Force a synchronous updateTree + captureState
-// so the element is indexed before logging the action. Otherwise the action
-// would carry a stale elementIndex referring to pre-modal DOM.
+// (e.g., React re-rendered a new view, modal opened). Wait for layout/paint
+// to settle before re-indexing — click handler runs BEFORE React's next
+// render, so immediate updateTree captures stale pre-render DOM.
 async function _ensureIndexed(el, triggerType) {
   if (_findElementIndex(el) !== null) return; // already indexed, fast path
   if (!_controller) return;
   try {
+    // Wait 2 animation frames: first lets React commit, second lets paint settle.
+    // Also a short hard delay as belt+suspenders for async state updates.
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    await new Promise((r) => setTimeout(r, 50));
+
     await _controller.updateTree();
-    _lastInteractiveCount = _controller.selectorMap?.size || 0;
-    // Capture a new state so AI sees the freshly-indexed DOM at compile time.
-    // Only capture if count changed meaningfully (avoid noise).
+    const newCount = _controller.selectorMap?.size || 0;
+
+    // Only capture if DOM meaningfully changed vs last captured snapshot.
+    // lastCapturedCount is tracked via meta so initial state capture seeds it.
     const meta = await _loadMeta();
-    const lastCount = meta?.lastCapturedCount ?? 0;
-    if (Math.abs(_lastInteractiveCount - lastCount) > INTERACTIVE_DELTA_THRESHOLD) {
+    const lastCount = meta?.lastCapturedCount;
+    const shouldCapture = lastCount == null
+      || Math.abs(newCount - lastCount) > INTERACTIVE_DELTA_THRESHOLD;
+
+    _lastInteractiveCount = newCount;
+
+    if (shouldCapture) {
       await _captureState({ type: "dom_grew", reason: triggerType || "unknown" });
-      await _persistMeta({ ...(await _loadMeta()), lastCapturedCount: _lastInteractiveCount });
     }
   } catch (err) {
     console.warn("[cffbrw] ensureIndexed failed:", err);

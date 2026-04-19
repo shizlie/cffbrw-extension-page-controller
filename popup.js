@@ -69,15 +69,41 @@ async function loadLastSchema() {
   const last = document.getElementById("last-schema");
   const lastId = document.getElementById("last-schema-id");
   const lastMeta = document.getElementById("last-schema-meta");
+  const lastRec = document.getElementById("last-recording-id");
   if (!last) return;
   last.style.display = "block";
   lastId.value = cffbrw_last_schema.id;
+  if (lastRec) lastRec.value = cffbrw_last_schema.recordingId || "(n/a — predates recording persistence)";
   const ageMs = Date.now() - (cffbrw_last_schema.at || 0);
   const ageMin = Math.floor(ageMs / 60000);
   const ageStr = ageMin < 1 ? "just now" : ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin / 60)}h ago`;
   const tools = Array.isArray(cffbrw_last_schema.tools) ? cffbrw_last_schema.tools.length : "?";
   lastMeta.textContent = `${cffbrw_last_schema.mode} · ${tools} tools · ${ageStr}`;
 }
+
+// Recompile button handler: re-runs AI compile on the stored recording.
+document.getElementById("recompile")?.addEventListener("click", async () => {
+  const { cffbrw_last_schema, gatewayUrl } = await chrome.storage.local.get(["cffbrw_last_schema", "gatewayUrl"]);
+  if (!cffbrw_last_schema?.recordingId) { showStatus("No recording to recompile", "err"); return; }
+  if (!gatewayUrl) { showStatus("Save Gateway URL first", "err"); return; }
+  showStatus("Recompiling from stored recording...", "");
+  try {
+    const res = await fetch(`${gatewayUrl}/v1/browser/recompile/${cffbrw_last_schema.recordingId}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    const data = await res.json();
+    if (!res.ok) { showStatus("Recompile error: " + (data.error ?? res.status), "err"); return; }
+    await chrome.storage.local.set({
+      cffbrw_last_schema: {
+        id: data.toolSchemaId, recordingId: data.recordingId, siteUrl: data.siteUrl,
+        mode: "recording (recompile #" + data.recompileCount + ")",
+        compiledAt: data.compiledAt, tools: data.tools, at: Date.now(),
+      },
+    });
+    await loadLastSchema();
+    showStatus(`Recompiled — ${data.tools.length} tools`, "ok");
+  } catch (e) { showStatus("Fetch error: " + e.message, "err"); }
+});
 
 // ── Compile status display (live while compile in progress) ─────
 

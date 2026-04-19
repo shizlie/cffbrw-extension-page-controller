@@ -161,7 +161,7 @@ async function stopAndCompileRecording(tabId) {
       notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: data.error || "HTTP " + res.status });
       return;
     }
-    await persistLastSchema({ id: data.toolSchemaId, siteUrl, mode: "recording", compiledAt: data.compiledAt, tools: data.tools });
+    await persistLastSchema({ id: data.toolSchemaId, recordingId: data.recordingId, siteUrl, mode: "recording", compiledAt: data.compiledAt, tools: data.tools });
     await setCompileStatus({ state: "done", toolSchemaId: data.toolSchemaId });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "done", toolSchemaId: data.toolSchemaId, toolCount: (data.tools || []).length });
   } catch (e) {
@@ -218,7 +218,7 @@ async function compileQuick(tabId) {
       await setCompileStatus({ state: "error", error: data.error || ("HTTP " + res.status) });
       return;
     }
-    await persistLastSchema({ id: data.toolSchemaId, siteUrl: data.siteUrl, mode: "quick", compiledAt: data.compiledAt, tools: data.tools });
+    await persistLastSchema({ id: data.toolSchemaId, recordingId: data.recordingId || null, siteUrl: data.siteUrl, mode: "quick", compiledAt: data.compiledAt, tools: data.tools });
     await setCompileStatus({ state: "done", toolSchemaId: data.toolSchemaId });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "done", toolSchemaId: data.toolSchemaId, toolCount: (data.tools || []).length });
   } catch (e) {
