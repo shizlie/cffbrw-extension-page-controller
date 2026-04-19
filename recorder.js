@@ -23,6 +23,11 @@ const INTERACTIVE_DELTA_THRESHOLD = 3;
 const CLICK_DEDUP_MS = 300;
 const INPUT_DEBOUNCE_MS = 500;
 const STATE_CHANGE_DEBOUNCE_MS = 800;
+// Cap how long we wait for mutations to settle. Without a cap, fast typing
+// inside a newly-opened modal keeps resetting the debounce forever and we
+// never capture the modal's DOM. 1500ms is long enough for React to finish
+// renders but short enough that modal state is guaranteed captured.
+const STATE_CHANGE_MAX_WAIT_MS = 1500;
 const MAX_STATES = 20;
 const MAX_ACTIONS = 500; // must match backend CompileRequestSchema cap
 const SIZE_WARNING_BYTES = 8 * 1024 * 1024; // 8MB
@@ -34,6 +39,7 @@ let _observer = null;
 let _lastInteractiveCount = 0;
 let _lastUrl = "";
 let _stateChangeTimer = null;
+let _stateChangeMaxTimer = null; // hard cap so debounce can't be reset forever
 let _awaitingStateCheck = false;
 let _inputTimers = new Map(); // elementIndex → timer
 let _lastClickTime = 0;
@@ -133,7 +139,10 @@ function _detachListeners() {
 
 // ── Click handler ────────────────────────────────────────────────
 
-function _onClickCapture(e) {
+async function _onClickCapture(e) {
+  // If clicked element is new to DOM (modal content, dynamic row), re-index
+  // so elementIndex references the fresh state.
+  await _ensureIndexed(e.target, "click");
   const index = _findElementIndex(e.target);
   if (index === null) return;
 
@@ -162,7 +171,8 @@ function _onClickCapture(e) {
 
 // ── Focus handler ────────────────────────────────────────────────
 
-function _onFocusCapture(e) {
+async function _onFocusCapture(e) {
+  await _ensureIndexed(e.target, "focus");
   const index = _findElementIndex(e.target);
   if (index === null) return;
 
@@ -185,7 +195,8 @@ function _onFocusCapture(e) {
 
 // ── Input handler (debounced) ────────────────────────────────────
 
-function _onInputCapture(e) {
+async function _onInputCapture(e) {
+  await _ensureIndexed(e.target, "input");
   const index = _findElementIndex(e.target);
   if (index === null) return;
 
@@ -305,10 +316,20 @@ function _scheduleStateCheck() {
   _awaitingStateCheck = true;
   if (_stateChangeTimer) clearTimeout(_stateChangeTimer);
   _stateChangeTimer = setTimeout(_checkStateChange, STATE_CHANGE_DEBOUNCE_MS);
+  // Hard cap: if mutations keep flowing (e.g. user typing in a modal),
+  // force a check after MAX_WAIT. Prevents never-capturing modal states.
+  if (!_stateChangeMaxTimer) {
+    _stateChangeMaxTimer = setTimeout(() => {
+      _stateChangeMaxTimer = null;
+      if (_stateChangeTimer) clearTimeout(_stateChangeTimer);
+      _checkStateChange();
+    }, STATE_CHANGE_MAX_WAIT_MS);
+  }
 }
 
 async function _checkStateChange() {
   _stateChangeTimer = null;
+  if (_stateChangeMaxTimer) { clearTimeout(_stateChangeMaxTimer); _stateChangeMaxTimer = null; }
   _awaitingStateCheck = false;
   if (!_controller) return;
 
@@ -625,12 +646,38 @@ async function _clearRecordingData() {
 
 function _findElementIndex(el) {
   if (!_controller?.selectorMap) return null;
+  // First pass: exact match (direct reference)
   for (const [index, node] of _controller.selectorMap.entries()) {
     if (node.ref === el) return index;
-    // Check if el is a child of the indexed element
+  }
+  // Second pass: containment (el is inside an indexed element — e.g. icon inside button)
+  for (const [index, node] of _controller.selectorMap.entries()) {
     if (node.ref?.contains(el)) return index;
   }
   return null;
+}
+
+// If the target element isn't in the current selectorMap, DOM has grown
+// (e.g., modal just opened). Force a synchronous updateTree + captureState
+// so the element is indexed before logging the action. Otherwise the action
+// would carry a stale elementIndex referring to pre-modal DOM.
+async function _ensureIndexed(el, triggerType) {
+  if (_findElementIndex(el) !== null) return; // already indexed, fast path
+  if (!_controller) return;
+  try {
+    await _controller.updateTree();
+    _lastInteractiveCount = _controller.selectorMap?.size || 0;
+    // Capture a new state so AI sees the freshly-indexed DOM at compile time.
+    // Only capture if count changed meaningfully (avoid noise).
+    const meta = await _loadMeta();
+    const lastCount = meta?.lastCapturedCount ?? 0;
+    if (Math.abs(_lastInteractiveCount - lastCount) > INTERACTIVE_DELTA_THRESHOLD) {
+      await _captureState({ type: "dom_grew", reason: triggerType || "unknown" });
+      await _persistMeta({ ...(await _loadMeta()), lastCapturedCount: _lastInteractiveCount });
+    }
+  } catch (err) {
+    console.warn("[cffbrw] ensureIndexed failed:", err);
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
