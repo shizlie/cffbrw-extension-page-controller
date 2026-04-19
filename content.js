@@ -232,6 +232,9 @@ async function executeTool(toolSchema, toolName, params) {
       for (const input of tool.inputs) {
         const value = params?.[input.name];
         if (value === undefined || value === null) continue;
+        // v3: Skip row-identifier params — they are templated into the submit
+        // selector at exec time, not typed into a DOM input.
+        if (input.selectorTemplate) continue;
         const el = findElement(input.selector, input.selectorStrategies, input.expectedProps);
         if (!el) { console.warn(`[cffbrw] input not found: ${input.selector}`); continue; }
         setInputValue(el, String(value));
@@ -240,9 +243,15 @@ async function executeTool(toolSchema, toolName, params) {
 
     await sleep(100);
 
-    if (tool.submitSelector) {
-      const submitEl = findElement(tool.submitSelector, tool.submitStrategies, tool.submitExpectedProps);
-      if (!submitEl) return { success: false, error: `Submit not found: ${tool.submitSelector}` };
+    // v3: If tool has submitSelectorTemplate, substitute params {name} into it.
+    // Example: "[data-action=\"delete-contact-{contactId}\"]" + {contactId:"7"}
+    //       => "[data-action=\"delete-contact-7\"]"
+    // Fallback to submitSelector if template absent or substitution leaves
+    // unresolved placeholders.
+    const submitTarget = resolveSubmitSelector(tool, params);
+    if (submitTarget) {
+      const submitEl = findElement(submitTarget, tool.submitStrategies, tool.submitExpectedProps);
+      if (!submitEl) return { success: false, error: `Submit not found: ${submitTarget}` };
       submitEl.click();
     }
 
@@ -254,6 +263,23 @@ async function executeTool(toolSchema, toolName, params) {
   } catch (err) {
     return { success: false, error: err.message || String(err) };
   }
+}
+
+// v3: If the tool has a submitSelectorTemplate (for row-scoped actions),
+// substitute {paramName} placeholders with param values. Returns the resolved
+// selector, or falls back to submitSelector if template has unfilled
+// placeholders or is absent.
+function resolveSubmitSelector(tool, params) {
+  if (tool.submitSelectorTemplate) {
+    const resolved = tool.submitSelectorTemplate.replace(/\{([^}]+)\}/g, (_m, name) => {
+      const v = params?.[name];
+      return v === undefined || v === null ? `{${name}}` : String(v);
+    });
+    // If any {placeholder} remains, fall back to literal selector
+    if (!/\{[^}]+\}/.test(resolved)) return resolved;
+    console.warn(`[cffbrw] submitSelectorTemplate has unfilled placeholders, falling back: ${resolved}`);
+  }
+  return tool.submitSelector || null;
 }
 
 function findElement(primarySelector, strategies, expectedProps) {
