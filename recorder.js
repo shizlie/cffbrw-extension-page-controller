@@ -149,11 +149,15 @@ async function _onClickCapture(e) {
   _lastClickTime = now;
 
   const el = e.target;
+  const identity = _buildActionIdentity(el);
   _logAction({
     type: "click",
     elementIndex: index,
     text: _getVisibleText(el),
     tag: el.tagName.toLowerCase(),
+    selector: identity.selector,
+    selectorStrategies: identity.selectorStrategies,
+    expectedProps: identity.expectedProps,
     context: _enrichElementContext(el),
     timestamp: now,
   });
@@ -242,11 +246,15 @@ async function _onFocusCapture(e) {
   const el = e.target;
   const label = _getFieldLabel(el);
 
+  const fId = _buildActionIdentity(el);
   _logAction({
     type: "focus",
     elementIndex: index,
     tag: el.tagName.toLowerCase(),
     label: label || undefined,
+    selector: fId.selector,
+    selectorStrategies: fId.selectorStrategies,
+    expectedProps: fId.expectedProps,
     context: _enrichElementContext(el),
     timestamp: Date.now(),
   });
@@ -305,6 +313,7 @@ function _commitInput(el, index) {
   const isSelect = el.tagName === "SELECT";
   const selectedText = isSelect ? el.options?.[el.selectedIndex]?.text : undefined;
 
+  const iId = _buildActionIdentity(el);
   _logAction({
     type: isSelect ? "select" : "input",
     elementIndex: index,
@@ -313,6 +322,9 @@ function _commitInput(el, index) {
     tag: el.tagName.toLowerCase(),
     label: label || undefined,
     fieldType: el.type || undefined,
+    selector: iId.selector,
+    selectorStrategies: iId.selectorStrategies,
+    expectedProps: iId.expectedProps,
     context: _enrichElementContext(el),
     timestamp: Date.now(),
   });
@@ -344,11 +356,15 @@ function _onKeydownCapture(e) {
   const index = _findElementIndex(e.target);
   if (index === null) return;
 
+  const kId = _buildActionIdentity(e.target);
   _logAction({
     type: "keydown",
     elementIndex: index,
     key: e.key,
     tag: e.target.tagName.toLowerCase(),
+    selector: kId.selector,
+    selectorStrategies: kId.selectorStrategies,
+    expectedProps: kId.expectedProps,
     context: _enrichElementContext(e.target),
     timestamp: Date.now(),
   });
@@ -592,6 +608,27 @@ function _fallbackSelector(el) {
   const tag = el.tagName.toLowerCase();
   const cls = el.className && typeof el.className === "string" ? `.${el.className.trim().split(/\s+/).join(".")}` : "";
   return tag + cls;
+}
+
+// ── Self-describing action identity ──────────────────────────────
+// Compute selector + fallback strategies + verify props directly from the
+// live target element at event time. Actions become SELF-DESCRIBING — no
+// dependency on PageController's selectorMap being fresh for the compiler
+// to resolve a selector. This is what proper recorders (Selenium IDE,
+// Playwright codegen, Chrome DevTools Recorder) do.
+function _buildActionIdentity(el) {
+  if (!el || el.nodeType !== Node.ELEMENT_NODE) {
+    return { selector: null, selectorStrategies: [], expectedProps: null };
+  }
+  // Reuse existing strategy builder. Pass empty node object since we don't
+  // have the PageController node wrapper — xpath path will be skipped.
+  const strategies = _buildStrategies(el, {});
+  const best = strategies.find((s) => s.selector);
+  return {
+    selector: best?.selector || _fallbackSelector(el),
+    selectorStrategies: strategies,
+    expectedProps: _buildVerifyProps(el),
+  };
 }
 
 // ── MutationObserver ─────────────────────────────────────────────
