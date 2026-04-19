@@ -181,19 +181,55 @@ async function _postClickReindex() {
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await new Promise((r) => setTimeout(r, 80));
 
+    // Capture signature BEFORE updateTree (snapshot of current map's shape)
+    const oldSignature = _signatureOfMap(_controller.selectorMap);
     const oldCount = _lastInteractiveCount;
+
     await _controller.updateTree();
     const newCount = _controller.selectorMap?.size || 0;
     _lastInteractiveCount = newCount;
 
-    if (Math.abs(newCount - oldCount) > INTERACTIVE_DELTA_THRESHOLD
-        || window.location.href !== _lastUrl) {
+    const newSignature = _signatureOfMap(_controller.selectorMap);
+    const countDelta = Math.abs(newCount - oldCount);
+    const urlChanged = window.location.href !== _lastUrl;
+    const signatureChanged = oldSignature !== newSignature;
+
+    // Capture on ANY meaningful DOM change. Signature catches page-swap
+    // scenarios where count is similar but identities are different
+    // (e.g., list 13 interactive → form 11 interactive: count delta 2,
+    // below threshold, but elements are fundamentally different).
+    if (countDelta >= INTERACTIVE_DELTA_THRESHOLD || urlChanged || signatureChanged) {
       _lastUrl = window.location.href;
       await _captureState({ type: "post_click_dom_change" });
     }
   } catch (err) {
     console.warn("[cffbrw] postClickReindex failed:", err);
   }
+}
+
+// Compact signature of the first N interactive elements: their tag + primary
+// distinguishing attribute. Changes when a page swap replaces form inputs
+// with list buttons even if total count is close.
+function _signatureOfMap(selectorMap) {
+  if (!selectorMap) return "";
+  const parts = [];
+  let i = 0;
+  for (const [, node] of selectorMap.entries()) {
+    if (i++ >= 8) break; // first 8 interactive elements are enough
+    const el = node.ref;
+    if (!el) { parts.push("_"); continue; }
+    const tag = el.tagName;
+    const key = el.id
+      || el.getAttribute("data-action")
+      || el.getAttribute("data-nav")
+      || el.getAttribute("data-input")
+      || el.name
+      || el.placeholder
+      || el.type
+      || "";
+    parts.push(`${tag}:${key}`);
+  }
+  return parts.join("|");
 }
 
 // ── Focus handler ────────────────────────────────────────────────
