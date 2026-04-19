@@ -44,14 +44,15 @@ let _lastClickIndex = -1;
 window.CffbrwRecorder = {
   async startRecording() {
     await _initController();
+    // Show overlay FIRST so subsequent updateCount calls have a target
+    if (typeof CffbrwOverlay !== "undefined") {
+      CffbrwOverlay.show();
+      CffbrwOverlay.updateCount(0, 0);
+    }
     await _captureState({ type: "initial" });
     _attachListeners();
     _startObserver();
     await _persistMeta({ active: true, tabId: null });
-    if (typeof CffbrwOverlay !== "undefined") {
-      CffbrwOverlay.show();
-      CffbrwOverlay.updateCount(1, 0);
-    }
     return { success: true };
   },
 
@@ -532,6 +533,11 @@ async function _logAction(action) {
   }
   actions.push(action);
   await chrome.storage.session.set({ [ACTIONS_KEY]: actions });
+
+  // Refresh overlay counter so user sees live feedback per action
+  if (typeof CffbrwOverlay !== "undefined") {
+    CffbrwOverlay.updateCount(meta?.stateCount || 1, actions.length);
+  }
 }
 
 // ── Action dedup/validation ──────────────────────────────────────
