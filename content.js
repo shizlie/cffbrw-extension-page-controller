@@ -323,10 +323,26 @@ function findByText(tag, text) {
 }
 
 function setInputValue(el, value) {
-  const setter = el.tagName === "TEXTAREA"
-    ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set
-    : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-  if (setter) setter.call(el, value); else el.value = value;
+  // Pick native prototype setter matching the element type. Calling an
+  // InputElement setter on a SelectElement throws "Illegal invocation"
+  // because the setter uses the "this" binding's internal slot.
+  let setter;
+  if (el.tagName === "SELECT") {
+    // SELECT: find option matching value (case-insensitive) or option text,
+    // fall back to literal value assignment. Dispatches change for React.
+    const v = String(value);
+    const byValue = Array.from(el.options).find((o) => o.value === v || o.value.toLowerCase() === v.toLowerCase());
+    const byText = byValue || Array.from(el.options).find((o) => o.text.trim() === v || o.text.trim().toLowerCase() === v.toLowerCase());
+    setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")?.set;
+    if (setter) setter.call(el, byText?.value ?? v);
+    else el.value = byText?.value ?? v;
+  } else if (el.tagName === "TEXTAREA") {
+    setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    if (setter) setter.call(el, value); else el.value = value;
+  } else {
+    setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+    if (setter) setter.call(el, value); else el.value = value;
+  }
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
 }
