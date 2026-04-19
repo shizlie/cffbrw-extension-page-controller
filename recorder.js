@@ -140,8 +140,7 @@ function _detachListeners() {
 // ── Click handler ────────────────────────────────────────────────
 
 async function _onClickCapture(e) {
-  // If clicked element is new to DOM (modal content, dynamic row), re-index
-  // so elementIndex references the fresh state.
+  // Re-index if the clicked element is new (modal/dynamic row spawned).
   await _ensureIndexed(e.target, "click");
   const index = _findElementIndex(e.target);
   if (index === null) return;
@@ -167,6 +166,36 @@ async function _onClickCapture(e) {
 
   // Trigger state check after click
   _scheduleStateCheck();
+
+  // CRITICAL: synchronously wait for React to render post-click, then re-index.
+  // Focus/input events fire AFTER this click handler returns. By awaiting here,
+  // those downstream handlers see a fresh selectorMap and log accurate indexes.
+  // Without this, clicks that navigate (e.g. "+ Add Contact" → form view)
+  // leave selectorMap pointing at old view's elements; the very next focus
+  // event on a form input resolves via stale containment match.
+  await _postClickReindex();
+}
+
+async function _postClickReindex() {
+  if (!_controller) return;
+  try {
+    // 2 rAFs = after React commit + paint. Extra setTimeout for async state.
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    await new Promise((r) => setTimeout(r, 80));
+
+    const oldCount = _lastInteractiveCount;
+    await _controller.updateTree();
+    const newCount = _controller.selectorMap?.size || 0;
+    _lastInteractiveCount = newCount;
+
+    if (Math.abs(newCount - oldCount) > INTERACTIVE_DELTA_THRESHOLD
+        || window.location.href !== _lastUrl) {
+      _lastUrl = window.location.href;
+      await _captureState({ type: "post_click_dom_change" });
+    }
+  } catch (err) {
+    console.warn("[cffbrw] postClickReindex failed:", err);
+  }
 }
 
 // ── Focus handler ────────────────────────────────────────────────
