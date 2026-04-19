@@ -133,7 +133,6 @@ function _onClickCapture(e) {
   const index = _findElementIndex(e.target);
   if (index === null) return;
 
-  // Dedup: ignore duplicate clicks within 300ms on same element
   const now = Date.now();
   if (index === _lastClickIndex && (now - _lastClickTime) < CLICK_DEDUP_MS) return;
   _lastClickIndex = index;
@@ -145,6 +144,7 @@ function _onClickCapture(e) {
     elementIndex: index,
     text: _getVisibleText(el),
     tag: el.tagName.toLowerCase(),
+    context: _enrichElementContext(el),
     timestamp: now,
   });
 
@@ -170,6 +170,7 @@ function _onFocusCapture(e) {
     elementIndex: index,
     tag: el.tagName.toLowerCase(),
     label: label || undefined,
+    context: _enrichElementContext(el),
     timestamp: Date.now(),
   });
 
@@ -234,6 +235,7 @@ function _commitInput(el, index) {
     tag: el.tagName.toLowerCase(),
     label: label || undefined,
     fieldType: el.type || undefined,
+    context: _enrichElementContext(el),
     timestamp: Date.now(),
   });
 
@@ -269,6 +271,7 @@ function _onKeydownCapture(e) {
     elementIndex: index,
     key: e.key,
     tag: e.target.tagName.toLowerCase(),
+    context: _enrichElementContext(e.target),
     timestamp: Date.now(),
   });
 
@@ -641,22 +644,310 @@ function _getVisibleText(el) {
 }
 
 function _getFieldLabel(el) {
-  // Try aria-label
+  // aria-labelledby — highest semantic priority
+  const labelledBy = el.getAttribute("aria-labelledby");
+  if (labelledBy) {
+    const parts = labelledBy.split(/\s+/).map((id) => {
+      const node = document.getElementById(id);
+      return node?.textContent.trim() || "";
+    }).filter(Boolean);
+    if (parts.length) return parts.join(" ");
+  }
+
+  // aria-label
   const ariaLabel = el.getAttribute("aria-label");
   if (ariaLabel) return ariaLabel;
 
-  // Try associated label
+  // <label for="id">
   if (el.id) {
     const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
     if (label) return label.textContent.trim();
   }
 
-  // Try placeholder
+  // Wrapping <label>
+  const wrapLabel = el.closest("label");
+  if (wrapLabel) {
+    // Strip the input's own value from text
+    const clone = wrapLabel.cloneNode(true);
+    clone.querySelectorAll("input, select, textarea").forEach((n) => n.remove());
+    const t = clone.textContent.trim();
+    if (t) return t;
+  }
+
+  // placeholder
   if (el.placeholder) return el.placeholder;
 
-  // Try name
+  // name attribute
   if (el.name) return el.name;
 
+  return null;
+}
+
+// ── Full element context enrichment ──────────────────────────────
+// Called on every action. Gives the AI compiler deep semantic context
+// about the element and its surroundings so it can name tools correctly,
+// parameterize row-scoped actions, and understand form fields.
+
+function _enrichElementContext(el) {
+  if (!el || el.nodeType !== Node.ELEMENT_NODE) return null;
+
+  const tag = el.tagName.toLowerCase();
+  const context = {
+    tag,
+    role: el.getAttribute("role") || null,
+    disabled: el.disabled === true || el.getAttribute("aria-disabled") === "true",
+  };
+
+  // ── Input context (input/select/textarea) ──
+  if (["input", "select", "textarea"].includes(tag)) {
+    context.input = {
+      type: el.type || tag,
+      name: el.name || null,
+      label: _getFieldLabel(el),
+      placeholder: el.placeholder || null,
+      required: el.required === true || el.getAttribute("aria-required") === "true",
+      pattern: el.pattern || null,
+      min: el.min || null,
+      max: el.max || null,
+      minLength: el.minLength > 0 ? el.minLength : null,
+      maxLength: el.maxLength > 0 ? el.maxLength : null,
+      helpText: _getHelpText(el),
+      options: tag === "select"
+        ? Array.from(el.options).slice(0, 20).map((o) => ({ value: o.value, text: o.text.trim() }))
+        : null,
+    };
+  }
+
+  // ── Button/link context ──
+  if (["button", "a"].includes(tag) || el.getAttribute("role") === "button") {
+    context.button = {
+      text: _getVisibleText(el) || null,
+      type: el.type || null, // submit | button | reset
+      ariaLabel: el.getAttribute("aria-label") || null,
+      href: tag === "a" ? el.getAttribute("href") : null,
+    };
+  }
+
+  // ── Form context ──
+  const form = el.closest("form");
+  if (form) {
+    context.form = {
+      name: form.getAttribute("name") || form.id || null,
+      action: form.getAttribute("action") || null,
+      method: (form.getAttribute("method") || "get").toLowerCase(),
+      label: _getFormLabel(form),
+      fieldCount: form.querySelectorAll("input, select, textarea").length,
+      submitText: _getFormSubmitText(form),
+    };
+  }
+
+  // ── Row context (table/list-item actions) ──
+  const rowAncestor = el.closest("tr, li, [role='row'], [role='listitem']");
+  if (rowAncestor) {
+    const rowContext = _buildRowContext(el, rowAncestor);
+    if (rowContext) context.row = rowContext;
+  }
+
+  // ── Table context ──
+  const table = el.closest("table, [role='grid'], [role='table']");
+  if (table) {
+    context.table = {
+      caption: table.querySelector("caption")?.textContent.trim() || null,
+      label: table.getAttribute("aria-label") || null,
+      columnHeaders: _getColumnHeaders(table),
+      rowCount: table.querySelectorAll("tbody tr, [role='row']").length,
+    };
+  }
+
+  // ── Modal/dialog context ──
+  const dialog = el.closest("[role='dialog'], dialog, [aria-modal='true']");
+  if (dialog) {
+    context.dialog = {
+      label: dialog.getAttribute("aria-label")
+        || dialog.querySelector("[role='heading'], h1, h2, h3")?.textContent.trim()
+        || null,
+    };
+  }
+
+  // ── Nav context ──
+  const nav = el.closest("nav, [role='navigation']");
+  if (nav) {
+    context.nav = {
+      label: nav.getAttribute("aria-label") || nav.getAttribute("data-nav-label") || null,
+    };
+  }
+
+  // ── Stable identity (survives DOM re-renders, row re-indexing) ──
+  context.stableId = _getStableId(el);
+
+  return context;
+}
+
+function _getHelpText(el) {
+  // aria-describedby
+  const describedBy = el.getAttribute("aria-describedby");
+  if (describedBy) {
+    const node = document.getElementById(describedBy);
+    if (node) return node.textContent.trim().slice(0, 200);
+  }
+  // Sibling .help, .hint, .description
+  const sibling = el.parentElement?.querySelector(".help, .hint, .description, .form-help, small");
+  if (sibling && sibling !== el) return sibling.textContent.trim().slice(0, 200);
+  return null;
+}
+
+function _getFormLabel(form) {
+  // <legend> for fieldsets
+  const legend = form.querySelector("legend");
+  if (legend) return legend.textContent.trim();
+  // First heading
+  const heading = form.querySelector("h1, h2, h3, h4, [role='heading']");
+  if (heading) return heading.textContent.trim();
+  // aria-label
+  return form.getAttribute("aria-label") || null;
+}
+
+function _getFormSubmitText(form) {
+  const submit = form.querySelector("button[type='submit'], input[type='submit'], button:not([type])");
+  if (!submit) return null;
+  return (submit.value || submit.textContent || "").trim() || null;
+}
+
+function _buildRowContext(el, rowAncestor) {
+  const container = rowAncestor.parentElement;
+  if (!container) return null;
+
+  const siblings = Array.from(container.children).filter(
+    (c) => c.tagName === rowAncestor.tagName
+  );
+  const siblingCount = siblings.length;
+  if (siblingCount < 2) return null; // not a repeating pattern
+
+  const rowPosition = siblings.indexOf(rowAncestor);
+
+  // Stable row identifier (id, data-id, data-key, data-row-id)
+  const rowStableId = rowAncestor.id
+    || rowAncestor.getAttribute("data-id")
+    || rowAncestor.getAttribute("data-key")
+    || rowAncestor.getAttribute("data-row-id")
+    || null;
+
+  // Detect selector pattern by comparing this button to siblings' buttons
+  const pattern = _detectSelectorPattern(el, rowAncestor, siblings);
+
+  // Column header (for table cells)
+  let columnHeader = null;
+  const cell = el.closest("td, th, [role='cell'], [role='gridcell']");
+  if (cell && rowAncestor.tagName === "TR") {
+    const cellIndex = Array.from(cell.parentElement.children).indexOf(cell);
+    const table = rowAncestor.closest("table, [role='grid']");
+    if (table) {
+      const headerCell = table.querySelectorAll("thead th, thead [role='columnheader']")[cellIndex];
+      if (headerCell) columnHeader = headerCell.textContent.trim();
+    }
+  }
+
+  return {
+    containerTag: rowAncestor.tagName.toLowerCase(),
+    siblingCount,
+    rowPosition,
+    rowStableId,
+    columnHeader,
+    pattern, // { prefix, suffix, currentValue, paramName } | null
+  };
+}
+
+function _detectSelectorPattern(clickedEl, rowAncestor, siblings) {
+  // For each sibling row, find the same-action button, extract its identifying attr
+  const clickedAction = clickedEl.getAttribute("data-action")
+    || clickedEl.getAttribute("data-id")
+    || clickedEl.getAttribute("data-key");
+
+  if (!clickedAction) return null;
+
+  // Find attribute name that changes across siblings
+  const attrName = ["data-action", "data-id", "data-key"].find((a) => clickedEl.getAttribute(a));
+  if (!attrName) return null;
+
+  // Collect values from siblings
+  const values = [];
+  for (const sibling of siblings) {
+    const matching = _findMatchingButton(sibling, clickedEl, rowAncestor);
+    const val = matching?.getAttribute(attrName);
+    if (val) values.push(val);
+  }
+
+  if (values.length < 2) return null;
+
+  // Find common prefix + suffix
+  const { prefix, suffix, uniqueParts } = _extractVaryingPart(values);
+  if (uniqueParts.length < 2) return null; // all siblings share same value, no pattern
+
+  // Infer param name from prefix (e.g., "delete-contact-" → "contactId")
+  const paramName = _inferParamName(prefix, suffix) || "rowId";
+
+  return {
+    attr: attrName,
+    prefix,
+    suffix,
+    currentValue: clickedAction,
+    uniqueIdentifier: clickedAction.slice(prefix.length, clickedAction.length - suffix.length),
+    paramName,
+    selectorTemplate: `[${attrName}="${prefix}{${paramName}}${suffix}"]`,
+  };
+}
+
+function _findMatchingButton(sibling, reference, rowAncestor) {
+  // Find sibling button with same text and tag as reference within the given row
+  const text = _getVisibleText(reference);
+  const tag = reference.tagName;
+  const candidates = sibling.querySelectorAll(tag);
+  for (const c of candidates) {
+    if (_getVisibleText(c) === text) return c;
+  }
+  return null;
+}
+
+function _extractVaryingPart(values) {
+  if (values.length < 2) return { prefix: "", suffix: "", uniqueParts: values };
+
+  // Common prefix
+  let prefix = values[0];
+  for (const v of values) {
+    while (!v.startsWith(prefix) && prefix.length > 0) prefix = prefix.slice(0, -1);
+  }
+  // Common suffix
+  let suffix = values[0];
+  for (const v of values) {
+    while (!v.endsWith(suffix) && suffix.length > 0) suffix = suffix.slice(1);
+  }
+  const uniqueParts = values.map((v) => v.slice(prefix.length, v.length - suffix.length));
+  const uniqueSet = new Set(uniqueParts);
+  return { prefix, suffix, uniqueParts: Array.from(uniqueSet) };
+}
+
+function _inferParamName(prefix, suffix) {
+  // Try to extract a meaningful noun from prefix like "delete-contact-" → "contactId"
+  const clean = (prefix + suffix).replace(/[^a-zA-Z0-9]+/g, " ").trim().split(/\s+/);
+  if (clean.length === 0) return null;
+  // Last word is most likely the entity name
+  const entity = clean[clean.length - 1];
+  if (!entity || entity.length < 2) return null;
+  return entity + "Id";
+}
+
+function _getColumnHeaders(table) {
+  const headers = Array.from(table.querySelectorAll("thead th, thead [role='columnheader']"));
+  return headers.map((h) => h.textContent.trim()).filter(Boolean).slice(0, 20);
+}
+
+function _getStableId(el) {
+  if (el.id) return { type: "id", value: el.id };
+  const dataId = el.getAttribute("data-id") || el.getAttribute("data-key") || el.getAttribute("data-testid");
+  if (dataId) {
+    const attr = el.hasAttribute("data-id") ? "data-id" : el.hasAttribute("data-key") ? "data-key" : "data-testid";
+    return { type: "data-attr", attr, value: dataId };
+  }
   return null;
 }
 
