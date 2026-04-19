@@ -657,9 +657,21 @@ function _findElementIndex(el) {
   for (const [index, node] of _controller.selectorMap.entries()) {
     if (node.ref === el) return index;
   }
-  // Second pass: containment (el is inside an indexed element — e.g. icon inside button)
+  // Second pass: containment + tag/interactive consistency.
+  // Requires the indexed ancestor to have the SAME tag as the target OR for
+  // the target to be non-interactive (text/icon inside a button). A button
+  // container that now holds a form input after React swap should NOT match —
+  // different interactive tags means stale DOM, force a re-index.
   for (const [index, node] of _controller.selectorMap.entries()) {
-    if (node.ref?.contains(el)) return index;
+    if (!node.ref?.contains(el)) continue;
+    if (node.ref === el) return index;
+    const targetTag = el.tagName;
+    const ancestorTag = node.ref.tagName;
+    const targetIsInteractive = ["INPUT", "SELECT", "TEXTAREA", "BUTTON", "A"].includes(targetTag);
+    const ancestorIsInteractive = ["INPUT", "SELECT", "TEXTAREA", "BUTTON", "A"].includes(ancestorTag);
+    // Reject if target is interactive and differs from ancestor — stale map
+    if (targetIsInteractive && targetTag !== ancestorTag) continue;
+    return index;
   }
   return null;
 }
