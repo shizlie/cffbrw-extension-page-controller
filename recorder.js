@@ -82,19 +82,17 @@ window.CffbrwRecorder = {
     return _captureState({ type: "manual_capture" });
   },
 
+  // Auto-resume disabled. Per-user request: extension was persisting active
+  // recording state across page reloads/navigations, causing new tabs/pages
+  // to silently resume recording with stale indices. Explicit Start Recording
+  // from the popup is now the only way to start. Any stale session state is
+  // purged below.
   async checkAutoResume() {
     const meta = await _loadMeta();
     if (meta?.active) {
-      await _initController();
-      _attachListeners();
-      _startObserver();
-      await _captureState({ type: "navigation" });
-      if (typeof CffbrwOverlay !== "undefined") {
-        const states = await _loadAllStates();
-        const actions = await _loadActions();
-        CffbrwOverlay.show();
-        CffbrwOverlay.updateCount(states.length, actions.length);
-      }
+      // Stale state from a prior session — clear it. No auto-resume.
+      await _clearRecordingData();
+      console.log("[cffbrw] cleared stale recording state on load (auto-resume disabled)");
     }
   },
 
