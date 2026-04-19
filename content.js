@@ -228,6 +228,18 @@ async function executeTool(toolSchema, toolName, params) {
       }
     }
 
+    // After navigation, wait for the target form to appear by polling for a
+    // known anchor element (submit button or first input). 300ms per nav click
+    // isn't enough for React's commit + paint on slower pages. Without this,
+    // fill/submit run against stale DOM and silently miss elements.
+    const anchorSelector = tool.submitSelector
+      || (tool.inputs?.[0]?.selector)
+      || null;
+    if (anchorSelector) {
+      const ready = await waitForElement(anchorSelector, 3000);
+      if (!ready) console.warn(`[cffbrw] form anchor never appeared: ${anchorSelector}`);
+    }
+
     if (Array.isArray(tool.inputs)) {
       for (const input of tool.inputs) {
         const value = params?.[input.name];
@@ -348,6 +360,21 @@ function setInputValue(el, value) {
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Poll document for an element matching `selector` up to `timeoutMs`.
+// Returns the element when found, null on timeout. Used post-navigation
+// to confirm form DOM rendered before filling/submitting.
+async function waitForElement(selector, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const el = document.querySelector(selector);
+      if (el) return el;
+    } catch { return null; }
+    await sleep(100);
+  }
+  return null;
+}
 
 async function waitForSignal(selector, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
