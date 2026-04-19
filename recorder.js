@@ -24,6 +24,7 @@ const CLICK_DEDUP_MS = 300;
 const INPUT_DEBOUNCE_MS = 500;
 const STATE_CHANGE_DEBOUNCE_MS = 800;
 const MAX_STATES = 20;
+const MAX_ACTIONS = 500; // must match backend CompileRequestSchema cap
 const SIZE_WARNING_BYTES = 8 * 1024 * 1024; // 8MB
 
 // ── State ────────────────────────────────────────────────────────
@@ -522,6 +523,13 @@ async function _logAction(action) {
   action.stateIndex = (meta?.stateCount || 1) - 1;
 
   const actions = await _loadActions();
+  if (actions.length >= MAX_ACTIONS) {
+    if (typeof CffbrwOverlay !== "undefined" && !meta?.actionCapWarned) {
+      CffbrwOverlay.toast(`Max ${MAX_ACTIONS} actions reached — stop & compile`);
+      await _persistMeta({ ...meta, actionCapWarned: true });
+    }
+    return; // drop action silently after warning
+  }
   actions.push(action);
   await chrome.storage.session.set({ [ACTIONS_KEY]: actions });
 }
