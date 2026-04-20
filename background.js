@@ -40,6 +40,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Recording: relay popup commands to active tab's content script
   if (message.type === "START_RECORDING") {
+    // Clear stale last-recording payload so the Copy button in the popup
+    // reflects the current session, not a leftover from a previous one.
+    chrome.storage.local.remove(["cffbrw_last_recording"]).catch(() => {});
     relayToTab(message.tabId, { type: "START_RECORDING" }, sendResponse);
     return true;
   }
@@ -154,6 +157,20 @@ async function stopAndCompileRecording(tabId) {
   if (workspaceToken) headers["Authorization"] = "Bearer " + workspaceToken;
   const siteUrl = stopped.states[0]?.url || "unknown";
 
+  // Persist full recording payload to local storage BEFORE compile attempt.
+  // Shape is contract-compatible with BrowserCompileRequestSchema so the
+  // user can copy + paste into any WebMCP / external service. Survives
+  // compile failure; only cleared at the start of the next recording.
+  await persistLastRecording({
+    siteUrl,
+    recording: true,
+    states: stopped.states,
+    actions: stopped.actions || [],
+    recordingId: null,
+    toolSchemaId: null,
+    savedAt: Date.now(),
+  });
+
   try {
     const res = await fetch(gatewayUrl + "/v1/browser/compile", {
       method: "POST", headers,
@@ -166,6 +183,9 @@ async function stopAndCompileRecording(tabId) {
       return;
     }
     await persistLastSchema({ id: data.toolSchemaId, recordingId: data.recordingId, siteUrl, mode: "recording", compiledAt: data.compiledAt, tools: data.tools });
+    // Stamp the server-assigned IDs onto the local payload so copy-out carries
+    // both the raw recording AND the backend reference.
+    await updateLastRecording({ recordingId: data.recordingId, toolSchemaId: data.toolSchemaId });
     await _clearRecordingMeta();
     await setCompileStatus({ state: "done", toolSchemaId: data.toolSchemaId });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "done", toolSchemaId: data.toolSchemaId, toolCount: (data.tools || []).length });
@@ -262,6 +282,31 @@ async function persistLastSchema(info) {
   await chrome.storage.local.set({
     cffbrw_last_schema: { ...info, at: Date.now() },
   });
+}
+
+// Full recording payload (contract-compatible with BrowserCompileRequestSchema).
+// Persists in chrome.storage.local so it survives SW restarts + popup close.
+// NOT cleared at compile terminal states — user can copy the payload any time
+// until they start a new recording (which clears it via the START_RECORDING
+// handler). Enables WebMCP planning / external service feeds.
+async function persistLastRecording(payload) {
+  try {
+    await chrome.storage.local.set({ cffbrw_last_recording: payload });
+  } catch (e) {
+    console.warn("[cffbrw] persistLastRecording failed:", e);
+  }
+}
+
+async function updateLastRecording(patch) {
+  try {
+    const { cffbrw_last_recording } = await chrome.storage.local.get("cffbrw_last_recording");
+    if (!cffbrw_last_recording) return;
+    await chrome.storage.local.set({
+      cffbrw_last_recording: { ...cffbrw_last_recording, ...patch },
+    });
+  } catch (e) {
+    console.warn("[cffbrw] updateLastRecording failed:", e);
+  }
 }
 
 function notifyOverlay(tabId, message) {

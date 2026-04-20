@@ -81,6 +81,40 @@ async function loadLastSchema() {
   lastMeta.textContent = `${cffbrw_last_schema.mode} · ${tools} tools · ${ageStr}`;
 }
 
+// Copy recording payload: full contract-compatible JSON for WebMCP / external.
+document.getElementById("copy-recording")?.addEventListener("click", async () => {
+  const { cffbrw_last_recording } = await chrome.storage.local.get("cffbrw_last_recording");
+  const meta = document.getElementById("copy-recording-meta");
+  if (!cffbrw_last_recording) {
+    if (meta) meta.textContent = "No recording saved yet.";
+    showStatus("No recording payload", "err");
+    return;
+  }
+  try {
+    const json = JSON.stringify(cffbrw_last_recording, null, 2);
+    await navigator.clipboard.writeText(json);
+    const kb = Math.round(new TextEncoder().encode(json).byteLength / 1024);
+    const states = cffbrw_last_recording.states?.length ?? 0;
+    const actions = cffbrw_last_recording.actions?.length ?? 0;
+    if (meta) meta.textContent = `copied: ${states} states, ${actions} actions, ${kb} KB`;
+    showStatus("Recording JSON copied", "ok");
+  } catch (e) {
+    showStatus("Copy failed: " + e.message, "err");
+  }
+});
+
+// Show last-recording age under Copy button on open.
+(async () => {
+  const { cffbrw_last_recording } = await chrome.storage.local.get("cffbrw_last_recording");
+  const meta = document.getElementById("copy-recording-meta");
+  if (!meta || !cffbrw_last_recording) return;
+  const states = cffbrw_last_recording.states?.length ?? 0;
+  const actions = cffbrw_last_recording.actions?.length ?? 0;
+  const ageMin = Math.floor((Date.now() - (cffbrw_last_recording.savedAt || 0)) / 60000);
+  const ageStr = ageMin < 1 ? "just now" : ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin / 60)}h ago`;
+  meta.textContent = `saved ${ageStr} · ${states} states, ${actions} actions`;
+})();
+
 // Recompile button handler: re-runs AI compile on the stored recording.
 document.getElementById("recompile")?.addEventListener("click", async () => {
   const { cffbrw_last_schema, gatewayUrl } = await chrome.storage.local.get(["cffbrw_last_schema", "gatewayUrl"]);
