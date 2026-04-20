@@ -124,11 +124,15 @@ async function stopAndCompileRecording(tabId) {
   try {
     stopped = await chrome.tabs.sendMessage(tabId, { type: "STOP_RECORDING" });
   } catch (e) {
+    // Content script gone (tab closed / navigated). Clear meta so popup
+    // doesn't show stale "Recording..." UI on next open.
+    await _clearRecordingMeta();
     await setCompileStatus({ state: "error", error: "Stop failed: " + e.message });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: "Stop failed" });
     return;
   }
   if (!stopped?.success || !stopped.states?.length) {
+    await _clearRecordingMeta();
     await setCompileStatus({ state: "error", error: "No states recorded" });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: "No states" });
     return;
@@ -162,9 +166,11 @@ async function stopAndCompileRecording(tabId) {
       return;
     }
     await persistLastSchema({ id: data.toolSchemaId, recordingId: data.recordingId, siteUrl, mode: "recording", compiledAt: data.compiledAt, tools: data.tools });
+    await _clearRecordingMeta();
     await setCompileStatus({ state: "done", toolSchemaId: data.toolSchemaId });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "done", toolSchemaId: data.toolSchemaId, toolCount: (data.tools || []).length });
   } catch (e) {
+    await _clearRecordingMeta();
     await setCompileStatus({ state: "error", error: e.message });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "error", error: e.message });
   }
@@ -219,9 +225,11 @@ async function compileQuick(tabId) {
       return;
     }
     await persistLastSchema({ id: data.toolSchemaId, recordingId: data.recordingId || null, siteUrl: data.siteUrl, mode: "quick", compiledAt: data.compiledAt, tools: data.tools });
+    await _clearRecordingMeta();
     await setCompileStatus({ state: "done", toolSchemaId: data.toolSchemaId });
     notifyOverlay(tabId, { type: "COMPILE_UPDATE", state: "done", toolSchemaId: data.toolSchemaId, toolCount: (data.tools || []).length });
   } catch (e) {
+    await _clearRecordingMeta();
     await setCompileStatus({ state: "error", error: e.message });
   }
 }
@@ -235,6 +243,19 @@ async function setCompileStatus(status) {
   await chrome.storage.session.set({
     cffbrw_compile_status: { ...status, at: Date.now() },
   });
+}
+
+// Belt-and-suspenders cleanup: recorder.js clears meta in stopRecording(),
+// but if the content script is gone (tab closed, SW restart mid-compile,
+// extension reload), that cleanup never runs and the popup re-enters the
+// recording UI on next open. Background clears meta from its own storage
+// view at every compile terminal state so the UI always recovers.
+async function _clearRecordingMeta() {
+  try {
+    await chrome.storage.session.remove(["cffbrw_meta", "cffbrw_actions"]);
+  } catch (e) {
+    console.warn("[cffbrw] clear meta failed:", e);
+  }
 }
 
 async function persistLastSchema(info) {
