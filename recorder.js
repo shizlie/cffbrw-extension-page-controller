@@ -14,6 +14,14 @@
 
 /* global CffbrwOverlay */
 
+// selectors.js is loaded before this script in the manifest and exposes the
+// filter via a global. Fallback is identity so recording never breaks if the
+// script load order changes.
+const filterStrategies = (s) =>
+  typeof window.__cffbrwFilterStrategies === "function"
+    ? window.__cffbrwFilterStrategies(s)
+    : s;
+
 const RECORDING_KEY = "cffbrw_recording";
 const STATES_PREFIX = "cffbrw_state_";
 const ACTIONS_KEY = "cffbrw_actions";
@@ -156,7 +164,7 @@ async function _onClickCapture(e) {
     text: _getVisibleText(el),
     tag: el.tagName.toLowerCase(),
     selector: identity.selector,
-    selectorStrategies: identity.selectorStrategies,
+    selectorStrategies: filterStrategies(identity.selectorStrategies),
     expectedProps: identity.expectedProps,
     context: _enrichElementContext(el),
     timestamp: now,
@@ -253,7 +261,7 @@ async function _onFocusCapture(e) {
     tag: el.tagName.toLowerCase(),
     label: label || undefined,
     selector: fId.selector,
-    selectorStrategies: fId.selectorStrategies,
+    selectorStrategies: filterStrategies(fId.selectorStrategies),
     expectedProps: fId.expectedProps,
     context: _enrichElementContext(el),
     timestamp: Date.now(),
@@ -323,7 +331,7 @@ function _commitInput(el, index) {
     label: label || undefined,
     fieldType: el.type || undefined,
     selector: iId.selector,
-    selectorStrategies: iId.selectorStrategies,
+    selectorStrategies: filterStrategies(iId.selectorStrategies),
     expectedProps: iId.expectedProps,
     context: _enrichElementContext(el),
     timestamp: Date.now(),
@@ -363,7 +371,7 @@ function _onKeydownCapture(e) {
     key: e.key,
     tag: e.target.tagName.toLowerCase(),
     selector: kId.selector,
-    selectorStrategies: kId.selectorStrategies,
+    selectorStrategies: filterStrategies(kId.selectorStrategies),
     expectedProps: kId.expectedProps,
     context: _enrichElementContext(e.target),
     timestamp: Date.now(),
@@ -626,7 +634,7 @@ function _buildActionIdentity(el) {
   const best = strategies.find((s) => s.selector);
   return {
     selector: best?.selector || _fallbackSelector(el),
-    selectorStrategies: strategies,
+    selectorStrategies: filterStrategies(strategies),
     expectedProps: _buildVerifyProps(el),
   };
 }

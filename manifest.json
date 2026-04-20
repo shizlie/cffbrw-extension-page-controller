@@ -9,7 +9,7 @@
   "action": { "default_popup": "popup.html" },
   "content_scripts": [{
     "matches": ["<all_urls>"],
-    "js": ["page-controller.bundle.js", "overlay.js", "recorder.js", "content.js"],
+    "js": ["page-controller.bundle.js", "overlay.js", "selectors.js", "recorder.js", "content.js"],
     "run_at": "document_idle"
   }]
 }
